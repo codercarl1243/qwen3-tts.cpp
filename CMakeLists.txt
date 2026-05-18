@@ -108,9 +108,11 @@ target_link_libraries(qwen3_tts PUBLIC
     audio_tokenizer_decoder
 )
 
-# Shared library with C API (for Nim FFI)
+# Shared library with C API (for Nim/Rust FFI). Includes the chunk-streaming
+# pipeline so callers can bind qwen3tts_synthesize_streaming directly.
 add_library(qwen3tts_shared SHARED
     src/pipeline/qwen3tts_c_api.cpp
+    src/streaming.cpp
 )
 set_target_properties(qwen3tts_shared PROPERTIES
     OUTPUT_NAME "qwen3tts"
@@ -119,6 +121,7 @@ set_target_properties(qwen3tts_shared PROPERTIES
 )
 target_include_directories(qwen3tts_shared PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 target_link_libraries(qwen3tts_shared PRIVATE
     qwen3_tts
@@ -186,6 +189,28 @@ target_link_libraries(test_decoder PRIVATE
     Threads::Threads
 )
 
+# Stubbed-codec test for the chunk-streaming algorithm. Gated on
+# BUILD_TESTING so consumers that build libqwen3tts without tests do not
+# need the test source tree.
+option(BUILD_TESTING "Build the unit test binaries" ON)
+if(BUILD_TESTING)
+    add_executable(test_chunk_streaming
+        tests/test_chunk_streaming.cpp
+        src/streaming.cpp
+    )
+    target_include_directories(test_chunk_streaming PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_chunk_streaming PRIVATE
+        Threads::Threads
+    )
+    add_test(NAME chunk_streaming_test
+        COMMAND test_chunk_streaming
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+endif()
+
 # Install targets
 install(TARGETS text_tokenizer tts_transformer audio_tokenizer_encoder audio_codec_encoder audio_tokenizer_decoder qwen3_tts qwen3tts_shared qwen3-tts-cli
     ARCHIVE DESTINATION lib
@@ -202,6 +227,10 @@ install(FILES
     src/pipeline/qwen3_tts.h
     src/pipeline/qwen3tts_c_api.h
     DESTINATION include
+)
+install(FILES
+    include/qwen3tts/streaming.h
+    DESTINATION include/qwen3tts
 )
 
 # CTest support
