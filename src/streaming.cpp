@@ -160,47 +160,9 @@ size_t ChunkStreamer::frames_in_buf() const {
 
 }  // namespace qwen3tts
 
-/* ---------------------------------------------------------------------------
- * Public C API.
- *
- * The opaque qwen3tts_ctx in this stage carries only the cancellation flag.
- * audio/04 (Rust FFI) extends it with the real talker/codec/sampler handles;
- * the C signatures below are frozen so the Rust crate can link against them
- * today.
- * ------------------------------------------------------------------------- */
-
-struct qwen3tts_ctx {
-    std::atomic<bool> cancel_flag;
-    qwen3tts_ctx() : cancel_flag(false) {}
-};
-
-extern "C" int qwen3tts_synthesize_streaming(qwen3tts_ctx*     ctx,
-                                             const char*       text,
-                                             uint32_t          chunk_frames,
-                                             qwen3tts_chunk_cb cb,
-                                             void*             user_data) {
-    (void)ctx;
-    (void)text;
-    (void)chunk_frames;
-    (void)cb;
-    (void)user_data;
-    // TODO(audio/04): wire ChunkStreamer to the real talker/codec pipeline.
-    // The chunk-streaming algorithm itself is implemented and tested via
-    // qwen3tts::ChunkStreamer; this entry-point exists today only so the
-    // Rust crate can resolve its FFI symbols. -ENOSYS-equivalent until then.
-    return -1;
-}
-
-extern "C" int qwen3tts_cancel(qwen3tts_ctx* ctx) {
-    if (!ctx) return -1;
-    ctx->cancel_flag.store(true, std::memory_order_release);
-    return 0;
-}
-
-extern "C" int qwen3tts_thermal_warmup(qwen3tts_ctx* ctx) {
-    (void)ctx;
-    // TODO(audio/04): synthesise "." through the real pipeline to prime the
-    // chunk graph. Until the pipeline is connected, this is a no-op so the
-    // Rust wrapper can invoke it during session-init without erroring.
-    return 0;
-}
+/* The opaque qwen3tts_ctx struct and the public C API (qwen3tts_context_new,
+ * qwen3tts_context_free, qwen3tts_synthesize_streaming, qwen3tts_cancel,
+ * qwen3tts_thermal_warmup) live in src/pipeline/qwen3tts_c_api.cpp.
+ * Keeping them out of this translation unit means test_chunk_streaming can
+ * link with only ChunkStreamer + Threads, without needing the Qwen3Tts
+ * engine dependency that context_new pulls in. */

@@ -19,10 +19,23 @@
 extern "C" {
 #endif
 
-/* Opaque streaming context. In production this aliases the underlying
- * Qwen3Tts engine state; tests may construct it directly via the C++
- * helpers in streaming.cpp. */
+/* Opaque streaming context. Holds the loaded Qwen3Tts engine plus the
+ * cancellation flag; constructed via qwen3tts_context_new and released via
+ * qwen3tts_context_free. Tests may construct it directly via the C++ helpers
+ * in streaming.cpp. */
 typedef struct qwen3tts_ctx qwen3tts_ctx;
+
+/* Create a streaming context, loading models from model_dir.
+ *
+ * model_dir must be a directory bundle containing the GGUF weights and
+ * tokenizer expected by Qwen3Tts::load_models.
+ *
+ * Returns NULL on failure (model directory missing or weights fail to load).
+ * The returned pointer must be freed with qwen3tts_context_free. */
+qwen3tts_ctx* qwen3tts_context_new(const char* model_dir);
+
+/* Release a context created by qwen3tts_context_new. No-op on NULL. */
+void qwen3tts_context_free(qwen3tts_ctx* ctx);
 
 /* Chunk callback: invoked once per fixed-size PCM chunk.
  *   pcm        — 24kHz mono float32 samples, valid for the duration of the call

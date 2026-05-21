@@ -5,6 +5,9 @@
  * Objective-C objects when called from background threads. */
 
 #include "pipeline/qwen3_tts.h"
+#include "qwen3tts/streaming.h"
+
+#include <atomic>
 
 #ifdef __APPLE__
 #include <objc/objc.h>
@@ -314,3 +317,67 @@ int32_t qwen3_tts_get_speaker_embedding(
 }
 
 } // extern "C"
+
+/* ---------------------------------------------------------------------------
+ * Streaming C API (qwen3tts_* namespace; declared in qwen3tts/streaming.h).
+ *
+ * The opaque qwen3tts_ctx wraps the loaded Qwen3Tts engine plus a
+ * cancellation flag. qwen3tts_synthesize_streaming is still a -1 stub until
+ * the real talker/codec pipeline is wired through ChunkStreamer; lifecycle
+ * (context_new/free) and cancel are functional.
+ *
+ * Defined here (not in src/streaming.cpp) so the ChunkStreamer unit test —
+ * which compiles streaming.cpp directly — does not have to link against the
+ * Qwen3Tts engine to satisfy these symbols.
+ * ------------------------------------------------------------------------- */
+
+struct qwen3tts_ctx {
+    Qwen3Tts*         engine;
+    std::atomic<bool> cancel_flag;
+    explicit qwen3tts_ctx(Qwen3Tts* e) : engine(e), cancel_flag(false) {}
+};
+
+extern "C" qwen3tts_ctx* qwen3tts_context_new(const char* model_dir) {
+    if (!model_dir) return nullptr;
+    Qwen3Tts* engine = qwen3_tts_create(model_dir, 4);
+    if (!engine) return nullptr;
+    return new qwen3tts_ctx(engine);
+}
+
+extern "C" void qwen3tts_context_free(qwen3tts_ctx* ctx) {
+    if (!ctx) return;
+    if (ctx->engine) qwen3_tts_destroy(ctx->engine);
+    delete ctx;
+}
+
+extern "C" int qwen3tts_synthesize_streaming(qwen3tts_ctx*     ctx,
+                                             const char*       text,
+                                             uint32_t          chunk_frames,
+                                             qwen3tts_chunk_cb cb,
+                                             void*             user_data) {
+    (void)ctx;
+    (void)text;
+    (void)chunk_frames;
+    (void)cb;
+    (void)user_data;
+    // TODO: wire ChunkStreamer to the real talker/codec pipeline via ctx->engine.
+    // The chunk-streaming algorithm itself is implemented and tested via
+    // qwen3tts::ChunkStreamer in src/streaming.cpp; this entry-point exists
+    // today only so the Rust crate can resolve its FFI symbols.
+    return -1;
+}
+
+extern "C" int qwen3tts_cancel(qwen3tts_ctx* ctx) {
+    if (!ctx) return -1;
+    ctx->cancel_flag.store(true, std::memory_order_release);
+    return 0;
+}
+
+extern "C" int qwen3tts_thermal_warmup(qwen3tts_ctx* ctx) {
+    (void)ctx;
+    // TODO: synthesise "." through the real pipeline to prime the chunk graph
+    // once ctx->engine is wired into qwen3tts_synthesize_streaming. Until then
+    // this is a no-op so the Rust wrapper can invoke it during session-init
+    // without erroring.
+    return 0;
+}
