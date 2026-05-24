@@ -2832,7 +2832,8 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
                                const int32_t * ref_text_tokens,
                                int32_t n_ref_text_tokens,
                                const int32_t * ref_codes,
-                               int32_t n_ref_frames) {
+                               int32_t n_ref_frames,
+                               const FrameCallback & frame_cb) {
 #ifdef QWEN3_TTS_TIMING
     using clk = std::chrono::high_resolution_clock;
     tts_timing timing = {};
@@ -3005,6 +3006,13 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 #ifdef QWEN3_TTS_TIMING
         timing.n_frames = frame + 1;
 #endif
+
+        // Per-frame hook (streaming + cooperative cancel). Fires after the
+        // frame's codes are committed; a false return stops generation with
+        // everything emitted so far retained in `output`.
+        if (frame_cb && !frame_cb(frame_codes.data(), cfg.n_codebooks)) {
+            break;
+        }
 
         if (frame + 1 >= max_len) {
             break;

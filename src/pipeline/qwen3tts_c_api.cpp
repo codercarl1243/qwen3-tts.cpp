@@ -322,9 +322,9 @@ int32_t qwen3_tts_get_speaker_embedding(
  * Streaming C API (qwen3tts_* namespace; declared in qwen3tts/streaming.h).
  *
  * The opaque qwen3tts_ctx wraps the loaded Qwen3Tts engine plus a
- * cancellation flag. qwen3tts_synthesize_streaming is still a -1 stub until
- * the real talker/codec pipeline is wired through ChunkStreamer; lifecycle
- * (context_new/free) and cancel are functional.
+ * cancellation flag. qwen3tts_synthesize_streaming drives the real
+ * talker/predictor loop (Qwen3TTS::synthesize_streaming), which decodes each
+ * chunk with left-context warm-up and forwards PCM through `cb`.
  *
  * Defined here (not in src/streaming.cpp) so the ChunkStreamer unit test —
  * which compiles streaming.cpp directly — does not have to link against the
@@ -355,16 +355,27 @@ extern "C" int qwen3tts_synthesize_streaming(qwen3tts_ctx*     ctx,
                                              uint32_t          chunk_frames,
                                              qwen3tts_chunk_cb cb,
                                              void*             user_data) {
-    (void)ctx;
-    (void)text;
-    (void)chunk_frames;
-    (void)cb;
-    (void)user_data;
-    // TODO: wire ChunkStreamer to the real talker/codec pipeline via ctx->engine.
-    // The chunk-streaming algorithm itself is implemented and tested via
-    // qwen3tts::ChunkStreamer in src/streaming.cpp; this entry-point exists
-    // today only so the Rust crate can resolve its FFI symbols.
-    return -1;
+    if (!ctx || !ctx->engine || !text || !cb) {
+        return -1;
+    }
+    // Fresh run — clear any cancel request left over from a prior call.
+    ctx->cancel_flag.store(false, std::memory_order_release);
+
+    auto on_chunk = [cb, user_data](const float* pcm, size_t n_samples) {
+        cb(pcm, n_samples, user_data);
+    };
+
+    bool ok;
+    AUTORELEASE_BEGIN
+    ok = ctx->engine->engine.synthesize_streaming(
+        text, (int32_t) chunk_frames, on_chunk, &ctx->cancel_flag);
+    AUTORELEASE_END
+
+    if (!ok) {
+        ctx->engine->last_error = ctx->engine->engine.get_error();
+        return -1;
+    }
+    return 0;
 }
 
 extern "C" int qwen3tts_cancel(qwen3tts_ctx* ctx) {
@@ -374,10 +385,26 @@ extern "C" int qwen3tts_cancel(qwen3tts_ctx* ctx) {
 }
 
 extern "C" int qwen3tts_thermal_warmup(qwen3tts_ctx* ctx) {
-    (void)ctx;
-    // TODO: synthesise "." through the real pipeline to prime the chunk graph
-    // once ctx->engine is wired into qwen3tts_synthesize_streaming. Until then
-    // this is a no-op so the Rust wrapper can invoke it during session-init
-    // without erroring.
+    if (!ctx || !ctx->engine) return -1;
+    ctx->cancel_flag.store(false, std::memory_order_release);
+
+    // Synthesise "." discarding output, to compile backend kernels and warm
+    // the decode allocator before the first user-visible synth. Bounded so
+    // warmup stays cheap; small chunk_frames so at least one decode runs.
+    auto discard = [](const float*, size_t) {};
+    qwen3_tts::tts_params params;
+    params.max_audio_tokens = 16;
+    params.print_timing     = false;
+
+    bool ok;
+    AUTORELEASE_BEGIN
+    ok = ctx->engine->engine.synthesize_streaming(
+        ".", /*chunk_frames=*/4, discard, &ctx->cancel_flag, params);
+    AUTORELEASE_END
+
+    if (!ok) {
+        ctx->engine->last_error = ctx->engine->engine.get_error();
+        return -1;
+    }
     return 0;
 }

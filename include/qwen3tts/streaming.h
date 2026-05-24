@@ -50,9 +50,16 @@ typedef void (*qwen3tts_chunk_cb)(const float* pcm,
 
 /* Streaming entry-point.
  *
- * Decodes text into codec frames, applies the chunk-streaming pipeline
- * (overlap-add, silent-frame penalty, hard-stop, tail-flush) and emits PCM
- * in groups of `chunk_frames` codec frames via `cb`.
+ * Runs the talker/predictor loop and emits PCM in groups of `chunk_frames`
+ * codec frames via `cb`. Each chunk is decoded with left-context warm-up
+ * (the preceding frames are re-decoded to give the causal conv stack its true
+ * receptive field, then their samples are dropped) so chunk joins are clean
+ * without an overlap-add crossfade. The trailing partial chunk is flushed when
+ * the talker emits EOS or hits its frame cap.
+ *
+ * n_samples passed to `cb` is the decoded payload size for the chunk; it is
+ * approximately chunk_frames * frame_samples but may vary slightly at edges,
+ * so callers must use n_samples rather than assuming a fixed chunk length.
  *
  * Returns 0 on success; non-zero on error. On cancellation the call returns 0
  * after the held-back final chunk is flushed.

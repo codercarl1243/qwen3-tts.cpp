@@ -985,6 +985,36 @@ bool AudioTokenizerDecoder::decode_chunked_cuda(const int32_t * codes, int32_t n
     return true;
 }
 
+bool AudioTokenizerDecoder::decode_chunk_with_context(const int32_t * codes, int32_t n_total,
+                                                      int32_t payload_start, int32_t context_frames,
+                                                      std::vector<float> & samples) {
+    samples.clear();
+    if (!model_.ctx) {
+        error_msg_ = "Model not loaded";
+        return false;
+    }
+    if (payload_start < 0 || payload_start >= n_total) {
+        // Nothing to emit (payload empty); not an error.
+        return true;
+    }
+
+    const auto & cfg = model_.config;
+    const int32_t ctx_start = std::max(0, payload_start - std::max(0, context_frames));
+    const int32_t seg_frames = n_total - ctx_start;
+    const int32_t warmup_frames = payload_start - ctx_start;
+
+    std::vector<float> seg_samples;
+    if (!decode_single(codes + (size_t) ctx_start * cfg.n_codebooks, seg_frames, ctx_start, seg_samples)) {
+        return false;
+    }
+
+    const int64_t drop = output_samples_for_frames(warmup_frames);
+    const size_t keep_from = (size_t) std::min<int64_t>(drop, (int64_t) seg_samples.size());
+    samples.assign(seg_samples.begin() + (std::vector<float>::difference_type) keep_from,
+                   seg_samples.end());
+    return true;
+}
+
 bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
                                     std::vector<float> & samples) {
     if (!model_.ctx) {

@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <atomic>
 #include <cstdint>
 
 namespace qwen3_tts {
@@ -95,6 +96,10 @@ struct tts_result {
 // Progress callback type
 using tts_progress_callback_t = std::function<void(int tokens_generated, int max_tokens)>;
 
+// Streaming PCM sink: invoked once per emitted chunk with 24kHz mono float32
+// samples. `pcm` is valid only for the duration of the call.
+using tts_chunk_callback_t = std::function<void(const float * pcm, size_t n_samples)>;
+
 // Main TTS class that orchestrates the full pipeline
 class Qwen3TTS {
 public:
@@ -113,6 +118,25 @@ public:
     // params: generation parameters
     tts_result synthesize(const std::string & text,
                           const tts_params & params = tts_params());
+
+    // Streaming synthesis: emit PCM incrementally as codec frames are generated.
+    //
+    // Runs the talker/predictor loop (transformer_.generate) with a per-frame
+    // hook; every `chunk_frames` codec frames it decodes the new payload using
+    // left-context warm-up (decode_chunk_with_context) and forwards the PCM to
+    // `on_chunk`. On EOS/max_len the trailing partial chunk is flushed.
+    //
+    // cancel_flag (optional): polled at each frame; when it becomes true the
+    // loop stops at the next frame boundary, the partial chunk is flushed, and
+    // the call returns true.
+    //
+    // Returns true on success (including clean cancellation), false on error
+    // (see get_error()).
+    bool synthesize_streaming(const std::string & text,
+                              int32_t chunk_frames,
+                              const tts_chunk_callback_t & on_chunk,
+                              const std::atomic<bool> * cancel_flag = nullptr,
+                              const tts_params & params = tts_params());
     
     // Generate speech with voice cloning
     // text: input text to synthesize

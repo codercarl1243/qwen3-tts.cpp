@@ -173,7 +173,20 @@ public:
     // Returns: audio samples normalized to [-1, 1] at 24kHz
     bool decode(const int32_t * codes, int32_t n_frames,
                 std::vector<float> & samples);
-    
+
+    // Streaming decode of a single chunk with left-context warm-up.
+    //
+    // codes points at frame 0 of the full accumulated buffer; n_total is the
+    // number of frames accumulated so far. Frames [payload_start, n_total) are
+    // the payload to emit; the preceding `context_frames` frames are re-decoded
+    // only to give the causal conv stack its true left receptive field, then
+    // their samples are dropped. For a causal decoder the kept output is
+    // bit-identical to a full decode — no crossfade needed. Backend-agnostic
+    // (the equivalent of decode_chunked_cuda, but not gated to CUDA).
+    bool decode_chunk_with_context(const int32_t * codes, int32_t n_total,
+                                   int32_t payload_start, int32_t context_frames,
+                                   std::vector<float> & samples);
+
     const audio_decoder_config & get_config() const { return model_.config; }
     
     const std::string & get_error() const { return error_msg_; }

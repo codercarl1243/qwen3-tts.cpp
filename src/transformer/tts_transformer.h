@@ -10,6 +10,7 @@
 #include <vector>
 #include <memory>
 #include <random>
+#include <functional>
 #ifdef QWEN3_TTS_TIMING
 #include <chrono>
 #endif
@@ -294,6 +295,14 @@ public:
     // ref_codes / n_ref_frames:     reference audio codes from AudioCodecEncoder.
     //                               Optional. When both ref_text and ref_codes are
     //                               provided, the prefill switches to ICL layout.
+    //
+    // frame_cb: optional per-frame hook invoked once per generated codec frame,
+    //           right after the frame's 16 codes are committed to `output`. The
+    //           argument is a pointer to the frame's [n_codebooks] codes. Return
+    //           false to stop generation early (cooperative cancellation). When
+    //           empty, generation runs to EOS/max_len as before — batch and
+    //           streaming callers share this one code path.
+    using FrameCallback = std::function<bool(const int32_t * frame_codes, int32_t n_codebooks)>;
     bool generate(const int32_t * text_tokens, int32_t n_tokens,
                   const float * speaker_embd, int32_t max_len,
                   std::vector<int32_t> & output,
@@ -304,7 +313,8 @@ public:
                   const int32_t * ref_text_tokens = nullptr,
                   int32_t n_ref_text_tokens = 0,
                   const int32_t * ref_codes = nullptr,
-                  int32_t n_ref_frames = 0);
+                  int32_t n_ref_frames = 0,
+                  const FrameCallback & frame_cb = {});
     
     const tts_transformer_config & get_config() const { return model_.config; }
 

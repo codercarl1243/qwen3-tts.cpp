@@ -617,6 +617,135 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
     return result;
 }
 
+bool Qwen3TTS::synthesize_streaming(const std::string & text,
+                                    int32_t chunk_frames,
+                                    const tts_chunk_callback_t & on_chunk,
+                                    const std::atomic<bool> * cancel_flag,
+                                    const tts_params & params) {
+    if (!models_loaded_) {
+        error_msg_ = "Models not loaded";
+        return false;
+    }
+    if (chunk_frames <= 0) {
+        chunk_frames = 8;
+    }
+
+    // Step 1: tokenize (same framing as synthesize_internal).
+    std::vector<int32_t> text_tokens;
+    if (!params.instruction.empty()) {
+        text_tokens = tokenizer_.encode_for_tts_with_instruction(text, params.instruction);
+    } else {
+        text_tokens = tokenizer_.encode_for_tts(text);
+    }
+    if (text_tokens.empty()) {
+        error_msg_ = "Failed to tokenize text";
+        return false;
+    }
+
+    // Step 2: ensure transformer + decoder are loaded (both lazy in low-mem).
+    if (!transformer_loaded_) {
+        if (!transformer_.load_model(tts_model_path_)) {
+            error_msg_ = "Failed to load TTS transformer: " + transformer_.get_error();
+            return false;
+        }
+        transformer_loaded_ = true;
+    }
+    transformer_.clear_kv_cache();
+    transformer_.set_f32_acc(params.f32_acc);
+    if (params.seed >= 0) {
+        transformer_.set_seed((uint32_t) params.seed);
+    }
+
+    if (!decoder_loaded_) {
+        if (decoder_model_path_.empty()) {
+            error_msg_ = "Internal error: missing vocoder model path";
+            return false;
+        }
+        if (!audio_decoder_.load_model(decoder_model_path_)) {
+            error_msg_ = "Failed to load vocoder: " + audio_decoder_.get_error();
+            return false;
+        }
+        decoder_loaded_ = true;
+    }
+
+    const int32_t n_codebooks = transformer_.get_config().n_codebooks;
+
+    // Left receptive-field warm-up frames re-decoded per chunk. 12 matches
+    // decode_chunked_cuda's chosen-safe default; same env knob.
+    int32_t context_frames = 12;
+    if (const char * env = std::getenv("QWEN3_TTS_DECODER_GPU_CONTEXT_FRAMES")) {
+        if (env[0] != '\0') {
+            context_frames = std::atoi(env);
+            if (context_frames < 0) context_frames = 0;
+        }
+    }
+
+    // Accumulate the full codec-frame buffer so each chunk decode has its true
+    // left context. payload_start tracks the first not-yet-emitted frame.
+    std::vector<int32_t> all_codes;
+    all_codes.reserve((size_t) params.max_audio_tokens * n_codebooks);
+    int32_t total_frames = 0;
+    int32_t payload_start = 0;
+    bool failed = false;
+
+    auto emit_through = [&](int32_t up_to) -> bool {
+        std::vector<float> pcm;
+        if (!audio_decoder_.decode_chunk_with_context(
+                all_codes.data(), up_to, payload_start, context_frames, pcm)) {
+            error_msg_ = "Streaming decode failed: " + audio_decoder_.get_error();
+            return false;
+        }
+        payload_start = up_to;
+        if (!pcm.empty() && on_chunk) {
+            on_chunk(pcm.data(), pcm.size());
+        }
+        return true;
+    };
+
+    TTSTransformer::FrameCallback frame_cb =
+        [&](const int32_t * frame_codes, int32_t ncb) -> bool {
+        if (cancel_flag && cancel_flag->load(std::memory_order_acquire)) {
+            return false;  // stop; trailing partial chunk flushed after generate()
+        }
+        all_codes.insert(all_codes.end(), frame_codes, frame_codes + ncb);
+        ++total_frames;
+        if (total_frames - payload_start >= chunk_frames) {
+            if (!emit_through(total_frames)) {
+                failed = true;
+                return false;
+            }
+        }
+        return true;
+    };
+
+    // Zero speaker embedding = model default voice (matches synthesize()); a
+    // non-null pointer keeps the prefill's speaker slot, so the layout matches
+    // the proven batch path.
+    std::vector<float> zero_embedding(transformer_.get_config().hidden_size, 0.0f);
+
+    std::vector<int32_t> speech_codes;  // generate() fills this too; we decode from all_codes
+    if (!transformer_.generate(text_tokens.data(), (int32_t) text_tokens.size(),
+                               zero_embedding.data(), params.max_audio_tokens, speech_codes,
+                               params.language_id, params.repetition_penalty,
+                               params.temperature, params.top_k,
+                               nullptr, 0, nullptr, 0, frame_cb)) {
+        error_msg_ = "Failed to generate speech codes: " + transformer_.get_error();
+        return false;
+    }
+    if (failed) {
+        return false;
+    }
+
+    // Flush trailing frames (final partial chunk, or everything if total < chunk).
+    if (total_frames > payload_start) {
+        if (!emit_through(total_frames)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 void Qwen3TTS::set_progress_callback(tts_progress_callback_t callback) {
     progress_callback_ = callback;
 }
