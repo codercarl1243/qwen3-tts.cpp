@@ -292,6 +292,75 @@ class Qwen3TTSConverter:
                 for name in f.keys():
                     yield name, f.get_tensor(name)
 
+    def _load_quant_params(self) -> dict[str, dict[str, torch.Tensor]]:
+        """Pre-load per-group quantisation parameters for packed-int8 weights.
+
+        CustomVoice-8bit models store linear weights as packed uint32 where
+        every uint32 contains four int8 bytes.  For each quantised weight
+        ``base.weight`` the model ships:
+
+        * ``base.scales``  — shape [out_features, n_groups], bfloat16
+        * ``base.biases``  — shape [out_features, n_groups], bfloat16
+
+        This method scans the safetensors files and returns a mapping
+        ``{base_name: {"scales": tensor, "biases": tensor}}``.  Only the small
+        scale/bias tensors are loaded here; the large weight tensors are left
+        for the main conversion pass.
+        """
+        quant_params: dict[str, dict[str, torch.Tensor]] = {}
+        for sf_path in sorted(self.input_dir.glob("*.safetensors")):
+            with safe_open(str(sf_path), framework="pt", device="cpu") as f:
+                for name in f.keys():
+                    if name.endswith((".scales", ".biases")):
+                        dot = name.rfind(".")
+                        base = name[:dot]
+                        suffix = name[dot + 1:]
+                        quant_params.setdefault(base, {})[suffix] = f.get_tensor(name)
+        logger.info(
+            "Found quantisation parameters for %d packed-int8 weight tensors",
+            len(quant_params),
+        )
+        return quant_params
+
+    def _dequantize_packed_int8(
+        self,
+        weight_uint32: torch.Tensor,
+        scales: torch.Tensor,
+        biases: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dequantize a uint32-packed int8 weight tensor to float32.
+
+        Each uint32 element packs four consecutive int8 weights in
+        little-endian byte order.  Per-group dequantisation:
+
+            w_f32[i, j] = w_int8[i, j] * scales[i, g] + biases[i, g]
+
+        where ``g = j // group_size`` and
+        ``group_size = in_features // n_groups``.
+        """
+        out_features, n_uint32 = weight_uint32.shape
+        in_features = n_uint32 * 4  # four int8 bytes per uint32
+
+        # Unpack: view memory as uint8, then reinterpret as signed int8.
+        weight_bytes = weight_uint32.numpy().view(np.uint8).reshape(out_features, in_features)
+        weight_int8 = weight_bytes.astype(np.int8).astype(np.float32)
+
+        scales_f32 = scales.float().numpy()   # [out_features, n_groups]
+        biases_f32 = biases.float().numpy()   # [out_features, n_groups]
+        n_groups = scales_f32.shape[1]
+        group_size = in_features // n_groups
+
+        weight_f32 = np.empty_like(weight_int8)
+        for g in range(n_groups):
+            c0 = g * group_size
+            c1 = c0 + group_size
+            weight_f32[:, c0:c1] = (
+                weight_int8[:, c0:c1] * scales_f32[:, g : g + 1]
+                + biases_f32[:, g : g + 1]
+            )
+
+        return torch.from_numpy(weight_f32)
+
     def _should_quantize(self, tensor_name: str) -> bool:
         """Determine if a tensor should be quantized (Q8_0) or kept in F16.
         
@@ -435,14 +504,40 @@ class Qwen3TTSConverter:
         tensor_count = 0
         skipped_count = 0
 
+        # Pre-load per-group quantisation parameters for packed-int8 weights.
+        # CustomVoice-8bit models store linear weight matrices as uint32-packed
+        # int8 values; companion .scales and .biases tensors carry the group-
+        # wise dequantisation factors.  We load these small tensors up-front so
+        # they are available when we encounter the corresponding weight tensors.
+        quant_params = self._load_quant_params()
+
         logger.info("Processing tensors...")
         for hf_name, tensor in tqdm(list(self._get_tensors()), desc="Converting"):
             ggml_name = self._map_tensor_name(hf_name)
 
             if ggml_name is None:
-                logger.warning(f"Skipping unmapped tensor: {hf_name}")
+                # Silently skip quantisation companion tensors (.scales, .biases).
+                # They are consumed via quant_params above, not written to GGUF.
+                if not hf_name.endswith((".scales", ".biases")):
+                    logger.warning(f"Skipping unmapped tensor: {hf_name}")
                 skipped_count += 1
                 continue
+
+            # Dequantize packed-int8 weight tensors before dtype conversion.
+            # CustomVoice-8bit models store these as torch.uint32 (four int8
+            # bytes per element) with per-group scales and biases.
+            if tensor.dtype == torch.uint32:
+                dot = hf_name.rfind(".")
+                base = hf_name[:dot] if dot >= 0 else hf_name
+                qp = quant_params.get(base, {})
+                if "scales" in qp and "biases" in qp:
+                    logger.debug(f"Dequantizing packed-int8: {hf_name}")
+                    tensor = self._dequantize_packed_int8(tensor, qp["scales"], qp["biases"])
+                else:
+                    logger.warning(
+                        f"uint32 tensor {hf_name!r} has no quant params "
+                        "(.scales/.biases not found) — writing raw bytes"
+                    )
 
             # Convert tensor
             data, dtype = self._convert_dtype(tensor, ggml_name)

@@ -186,6 +186,7 @@ bool Qwen3TTS::load_models(const std::string & model_dir,
     int64_t t_transformer_start = get_time_ms();
     if (!transformer_.load_model(tts_model_path_)) {
         error_msg_ = "Failed to load TTS transformer: " + transformer_.get_error();
+        fprintf(stderr, "  ERROR: %s\n", error_msg_.c_str());  // surface load errors
         return false;
     }
     transformer_loaded_ = true;
