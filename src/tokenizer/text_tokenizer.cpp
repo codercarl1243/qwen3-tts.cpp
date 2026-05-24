@@ -248,16 +248,17 @@ std::vector<int32_t> TextTokenizer::encode(const std::string & text) const {
     
     std::vector<int32_t> tokens;
 
-    // Unicode-aware GPT-2 regex pre-tokenization
+    // Unicode-aware GPT-2 regex pre-tokenization. Note: unicode_regex_split
+    // already returns each word in GPT-2 byte-encoded form (via
+    // unicode_byte_encoding_process), so it must NOT be byte-encoded again here.
     std::vector<std::string> words = unicode_regex_split(text, GPT2_REGEX_EXPRS);
     if (words.empty() && !text.empty()) {
         words.push_back(bytes_to_unicode(text));
     }
-    
-    // BPE encode each word (convert to GPT-2 unicode first)
+
+    // BPE encode each (already byte-encoded) word.
     for (const auto & word : words) {
-        std::string unicode_word = bytes_to_unicode(word);
-        auto bpe_tokens = bpe(unicode_word);
+        auto bpe_tokens = bpe(word);
         for (const auto & tok : bpe_tokens) {
             auto it = vocab_.find(tok);
             if (it != vocab_.end()) {
