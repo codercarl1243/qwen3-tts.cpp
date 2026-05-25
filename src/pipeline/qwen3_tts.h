@@ -136,7 +136,9 @@ public:
                               int32_t chunk_frames,
                               const tts_chunk_callback_t & on_chunk,
                               const std::atomic<bool> * cancel_flag = nullptr,
-                              const tts_params & params = tts_params());
+                              const tts_params & params = tts_params(),
+                              const float * speaker_embedding = nullptr,
+                              int32_t embedding_size = 0);
     
     // Generate speech with voice cloning
     // text: input text to synthesize

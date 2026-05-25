@@ -57,6 +57,11 @@ typedef void (*qwen3tts_chunk_cb)(const float* pcm,
  * without an overlap-add crossfade. The trailing partial chunk is flushed when
  * the talker emits EOS or hits its frame cap.
  *
+ * speaker_name — null-terminated preset voice name (e.g. "ono_anna").
+ *   Pass NULL or "" to use the model default voice (zero speaker embedding).
+ *   Known presets: vivian serena uncle_fu dylan eric ryan aiden ono_anna sohee.
+ *   An unrecognised name causes the call to return non-zero immediately.
+ *
  * language_id — qwen3-tts codec language token id (e.g. 2058 for Japanese).
  *   Pass a positive value to condition the model on a specific language.
  *   Pass 0 or negative to use the model default (no language token inserted).
@@ -71,6 +76,7 @@ typedef void (*qwen3tts_chunk_cb)(const float* pcm,
 int qwen3tts_synthesize_streaming(qwen3tts_ctx*       ctx,
                                   const char*         text,
                                   uint32_t            chunk_frames,
+                                  const char*         speaker_name,
                                   int32_t             language_id,
                                   qwen3tts_chunk_cb   cb,
                                   void*               user_data);

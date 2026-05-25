@@ -353,12 +353,11 @@ extern "C" void qwen3tts_context_free(qwen3tts_ctx* ctx) {
 extern "C" int qwen3tts_synthesize_streaming(qwen3tts_ctx*     ctx,
                                              const char*       text,
                                              uint32_t          chunk_frames,
+                                             const char*       speaker_name,
                                              int32_t           language_id,
                                              qwen3tts_chunk_cb cb,
                                              void*             user_data) {
-    if (!ctx || !ctx->engine || !text || !cb) {
-        return -1;
-    }
+    if (!ctx || !ctx->engine || !text || !cb) return -1;
     // Fresh run — clear any cancel request left over from a prior call.
     ctx->cancel_flag.store(false, std::memory_order_release);
 
@@ -367,20 +366,27 @@ extern "C" int qwen3tts_synthesize_streaming(qwen3tts_ctx*     ctx,
     };
 
     qwen3_tts::tts_params params;
-    if (language_id > 0) {
-        params.language_id = language_id;
+    if (language_id > 0) params.language_id = language_id;
+
+    // Resolve preset name → embedding. Empty / null name → zero embedding
+    // (model default voice), which synthesize_streaming already handles.
+    std::vector<float> emb;
+    if (speaker_name && speaker_name[0] != '\0') {
+        if (!ctx->engine->engine.get_speaker_embedding(speaker_name, emb)) {
+            ctx->engine->last_error = ctx->engine->engine.get_error();
+            return -1;
+        }
     }
+    const float* emb_ptr  = emb.empty() ? nullptr : emb.data();
+    int32_t      emb_size = (int32_t) emb.size();
 
     bool ok;
     AUTORELEASE_BEGIN
     ok = ctx->engine->engine.synthesize_streaming(
-        text, (int32_t) chunk_frames, on_chunk, &ctx->cancel_flag, params);
+        text, (int32_t) chunk_frames, on_chunk, &ctx->cancel_flag, params, emb_ptr, emb_size);
     AUTORELEASE_END
 
-    if (!ok) {
-        ctx->engine->last_error = ctx->engine->engine.get_error();
-        return -1;
-    }
+    if (!ok) { ctx->engine->last_error = ctx->engine->engine.get_error(); return -1; }
     return 0;
 }
 

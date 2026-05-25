@@ -621,7 +621,9 @@ bool Qwen3TTS::synthesize_streaming(const std::string & text,
                                     int32_t chunk_frames,
                                     const tts_chunk_callback_t & on_chunk,
                                     const std::atomic<bool> * cancel_flag,
-                                    const tts_params & params) {
+                                    const tts_params & params,
+                                    const float * speaker_embedding,
+                                    int32_t embedding_size) {
     if (!models_loaded_) {
         error_msg_ = "Models not loaded";
         return false;
@@ -720,12 +722,17 @@ bool Qwen3TTS::synthesize_streaming(const std::string & text,
 
     // Zero speaker embedding = model default voice (matches synthesize()); a
     // non-null pointer keeps the prefill's speaker slot, so the layout matches
-    // the proven batch path.
+    // the proven batch path. If a preset embedding was resolved by the caller,
+    // use it instead of the zeros.
     std::vector<float> zero_embedding(transformer_.get_config().hidden_size, 0.0f);
+    const float * embd = zero_embedding.data();
+    if (speaker_embedding && embedding_size == transformer_.get_config().hidden_size) {
+        embd = speaker_embedding;
+    }
 
     std::vector<int32_t> speech_codes;  // generate() fills this too; we decode from all_codes
     if (!transformer_.generate(text_tokens.data(), (int32_t) text_tokens.size(),
-                               zero_embedding.data(), params.max_audio_tokens, speech_codes,
+                               embd, params.max_audio_tokens, speech_codes,
                                params.language_id, params.repetition_penalty,
                                params.temperature, params.top_k,
                                nullptr, 0, nullptr, 0, frame_cb)) {
