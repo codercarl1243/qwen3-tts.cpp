@@ -353,6 +353,7 @@ extern "C" void qwen3tts_context_free(qwen3tts_ctx* ctx) {
 extern "C" int qwen3tts_synthesize_streaming(qwen3tts_ctx*     ctx,
                                              const char*       text,
                                              uint32_t          chunk_frames,
+                                             int32_t           language_id,
                                              qwen3tts_chunk_cb cb,
                                              void*             user_data) {
     if (!ctx || !ctx->engine || !text || !cb) {
@@ -365,10 +366,15 @@ extern "C" int qwen3tts_synthesize_streaming(qwen3tts_ctx*     ctx,
         cb(pcm, n_samples, user_data);
     };
 
+    qwen3_tts::tts_params params;
+    if (language_id > 0) {
+        params.language_id = language_id;
+    }
+
     bool ok;
     AUTORELEASE_BEGIN
     ok = ctx->engine->engine.synthesize_streaming(
-        text, (int32_t) chunk_frames, on_chunk, &ctx->cancel_flag);
+        text, (int32_t) chunk_frames, on_chunk, &ctx->cancel_flag, params);
     AUTORELEASE_END
 
     if (!ok) {

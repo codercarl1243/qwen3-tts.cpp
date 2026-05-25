@@ -57,6 +57,10 @@ typedef void (*qwen3tts_chunk_cb)(const float* pcm,
  * without an overlap-add crossfade. The trailing partial chunk is flushed when
  * the talker emits EOS or hits its frame cap.
  *
+ * language_id — qwen3-tts codec language token id (e.g. 2058 for Japanese).
+ *   Pass a positive value to condition the model on a specific language.
+ *   Pass 0 or negative to use the model default (no language token inserted).
+ *
  * n_samples passed to `cb` is the decoded payload size for the chunk; it is
  * approximately chunk_frames * frame_samples but may vary slightly at edges,
  * so callers must use n_samples rather than assuming a fixed chunk length.
@@ -67,6 +71,7 @@ typedef void (*qwen3tts_chunk_cb)(const float* pcm,
 int qwen3tts_synthesize_streaming(qwen3tts_ctx*       ctx,
                                   const char*         text,
                                   uint32_t            chunk_frames,
+                                  int32_t             language_id,
                                   qwen3tts_chunk_cb   cb,
                                   void*               user_data);
 
