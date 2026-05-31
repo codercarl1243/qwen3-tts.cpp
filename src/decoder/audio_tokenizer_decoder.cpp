@@ -438,7 +438,8 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_pre_tfm_layer(struct ggml_cont
                                                                  struct ggml_tensor * x,
                                                                  const pre_tfm_layer & layer,
                                                                  int32_t n_frames,
-                                                                 struct ggml_tensor * positions) {
+                                                                 struct ggml_tensor * positions,
+                                                                 struct ggml_tensor * kq_mask) {
     const auto & cfg = model_.config;
     const int n_heads = cfg.n_heads;
     const int qkv_dim = cfg.latent_dim;
@@ -470,20 +471,16 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_pre_tfm_layer(struct ggml_cont
                          head_dim, GGML_ROPE_TYPE_NEOX, 0,
                          cfg.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
     
+    // Fused scaled-dot-product attention via flash attention. Q stays F32 (Metal kernel
+    // requires src[0]==F32); K/V are cast to F16 to hit the fast simdgroup_mm pipeline.
+    // The causal mask (built once per graph) replaces the old diag_mask_inf + soft_max chain.
     struct ggml_tensor * Q = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
-    struct ggml_tensor * K = ggml_permute(ctx, Kcur, 0, 2, 1, 3);
-    struct ggml_tensor * V = ggml_permute(ctx, Vcur, 0, 2, 1, 3);
-    
-    struct ggml_tensor * KQ = ggml_mul_mat(ctx, K, Q);
-    KQ = ggml_scale(ctx, KQ, 1.0f / sqrtf((float)head_dim));
-    // Apply causal mask (each position can only attend to itself and previous positions)
-    KQ = ggml_diag_mask_inf(ctx, KQ, 0);
-    KQ = ggml_soft_max(ctx, KQ);
-    
-    V = ggml_cont(ctx, ggml_transpose(ctx, V));
-    
-    struct ggml_tensor * KQV = ggml_mul_mat(ctx, V, KQ);
-    KQV = ggml_permute(ctx, KQV, 0, 2, 1, 3);
+    struct ggml_tensor * K = ggml_cast(ctx, ggml_permute(ctx, Kcur, 0, 2, 1, 3), GGML_TYPE_F16);
+    struct ggml_tensor * V = ggml_cast(ctx, ggml_permute(ctx, Vcur, 0, 2, 1, 3), GGML_TYPE_F16);
+
+    const float kq_scale = 1.0f / sqrtf((float)head_dim);
+    struct ggml_tensor * KQV = ggml_flash_attn_ext(ctx, Q, K, V, kq_mask, kq_scale, 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(KQV, GGML_PREC_F32);
     struct ggml_tensor * attn_out = ggml_cont_2d(ctx, KQV, n_heads * head_dim, n_frames);
     
     attn_out = ggml_mul_mat(ctx, layer.attn_output_w, attn_out);
@@ -752,9 +749,15 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames) {
     struct ggml_tensor * positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_frames);
     ggml_set_name(positions, "positions");
     ggml_set_input(positions);
-    
+
+    // Causal mask for flash attention: F16, [n_kv, n_q]; filled host-side in compute().
+    // Shared across all pre-tfm layers (same n_frames). ne[1] >= n_queries per Metal kernel.
+    struct ggml_tensor * kq_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_frames, n_frames);
+    ggml_set_name(kq_mask, "kq_mask");
+    ggml_set_input(kq_mask);
+
      for (int i = 0; i < cfg.n_pre_tfm_layers; ++i) {
-         cur = apply_pre_tfm_layer(ctx0, cur, model_.pre_tfm_layers[i], n_frames, positions);
+         cur = apply_pre_tfm_layer(ctx0, cur, model_.pre_tfm_layers[i], n_frames, positions, kq_mask);
      }
      
      if (model_.pre_tfm_norm_w) {
@@ -910,8 +913,23 @@ bool AudioTokenizerDecoder::decode_single(const int32_t * codes, int32_t n_frame
         for (int i = 0; i < n_frames; ++i) {
             positions[i] = position_offset + i;
         }
-        ggml_backend_tensor_set(positions_tensor, positions.data(), 0, 
+        ggml_backend_tensor_set(positions_tensor, positions.data(), 0,
                                 n_frames * sizeof(int32_t));
+    }
+
+    // Causal flash-attn mask, layout [n_kv, n_q]: query i attends to key j iff j <= i.
+    struct ggml_tensor * kq_mask_tensor = ggml_graph_get_tensor(gf, "kq_mask");
+    if (kq_mask_tensor) {
+        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+        std::vector<ggml_fp16_t> mask((size_t)n_frames * n_frames);
+        for (int i = 0; i < n_frames; ++i) {
+            for (int j = 0; j < n_frames; ++j) {
+                mask[(size_t)i * n_frames + j] = (j <= i) ? zero : neg_inf;
+            }
+        }
+        ggml_backend_tensor_set(kq_mask_tensor, mask.data(), 0,
+                                mask.size() * sizeof(ggml_fp16_t));
     }
     
 

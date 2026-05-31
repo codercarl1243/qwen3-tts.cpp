@@ -219,7 +219,8 @@ private:
                                               struct ggml_tensor * x,
                                               const pre_tfm_layer & layer,
                                               int32_t n_frames,
-                                              struct ggml_tensor * positions);
+                                              struct ggml_tensor * positions,
+                                              struct ggml_tensor * kq_mask);
     
     // Apply upsample block (ConvNeXt-style)
     struct ggml_tensor * apply_upsample_block(struct ggml_context * ctx,
