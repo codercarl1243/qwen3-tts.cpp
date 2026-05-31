@@ -1,3 +1,4 @@
 [submodule "ggml"]
 	path = ggml
-	url = https://github.com/ggml-org/ggml.git
+	url = git@github.com:codercarl1243/ggml.git
+	branch = kaiwa-metal
