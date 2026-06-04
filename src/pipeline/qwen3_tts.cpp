@@ -682,12 +682,26 @@ bool Qwen3TTS::synthesize_streaming(const std::string & text,
         }
     }
 
+    // Ramp: emit the first chunk after few frames, then grow geometrically to
+    // chunk_frames. Cuts time-to-first-audio; causal decode keeps output
+    // bit-identical regardless of chunk size. Clamp to [1, chunk_frames]; a
+    // value >= chunk_frames disables the ramp.
+    int32_t first_chunk_frames = 4;
+    if (const char * env = std::getenv("QWEN3_TTS_FIRST_CHUNK_FRAMES")) {
+        if (env[0] != '\0') {
+            first_chunk_frames = std::atoi(env);
+        }
+    }
+    if (first_chunk_frames < 1) first_chunk_frames = 1;
+    if (first_chunk_frames > chunk_frames) first_chunk_frames = chunk_frames;
+
     // Accumulate the full codec-frame buffer so each chunk decode has its true
     // left context. payload_start tracks the first not-yet-emitted frame.
     std::vector<int32_t> all_codes;
     all_codes.reserve((size_t) params.max_audio_tokens * n_codebooks);
     int32_t total_frames = 0;
     int32_t payload_start = 0;
+    int32_t effective_chunk = first_chunk_frames;
     bool failed = false;
 
     auto emit_through = [&](int32_t up_to) -> bool {
@@ -711,11 +725,12 @@ bool Qwen3TTS::synthesize_streaming(const std::string & text,
         }
         all_codes.insert(all_codes.end(), frame_codes, frame_codes + ncb);
         ++total_frames;
-        if (total_frames - payload_start >= chunk_frames) {
+        if (total_frames - payload_start >= effective_chunk) {
             if (!emit_through(total_frames)) {
                 failed = true;
                 return false;
             }
+            effective_chunk = std::min(chunk_frames, effective_chunk * 2);
         }
         return true;
     };
