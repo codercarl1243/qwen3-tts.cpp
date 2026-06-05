@@ -682,11 +682,11 @@ bool Qwen3TTS::synthesize_streaming(const std::string & text,
         }
     }
 
-    // Ramp: emit the first chunk after few frames, then grow geometrically to
-    // chunk_frames. Cuts time-to-first-audio; causal decode keeps output
-    // bit-identical regardless of chunk size. Clamp to [1, chunk_frames]; a
-    // value >= chunk_frames disables the ramp.
-    int32_t first_chunk_frames = 4;
+    // Ramp first chunk small then grow to chunk_frames. Default OFF (=chunk_frames):
+    // measured no TTFA win (LLM dominates first_audio, not the vocoder) and small
+    // first chunks caused audible boundary artifacts. Knob kept for re-testing if
+    // the LLM path ever becomes faster than TTS. See AUDIO_PIPELINE.md TTFA log.
+    int32_t first_chunk_frames = 16;
     if (const char * env = std::getenv("QWEN3_TTS_FIRST_CHUNK_FRAMES")) {
         if (env[0] != '\0') {
             first_chunk_frames = std::atoi(env);
