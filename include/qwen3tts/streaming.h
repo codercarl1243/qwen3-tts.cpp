@@ -78,6 +78,7 @@ int qwen3tts_synthesize_streaming(qwen3tts_ctx*       ctx,
                                   uint32_t            chunk_frames,
                                   const char*         speaker_name,
                                   int32_t             language_id,
+                                  int32_t             seed,
                                   qwen3tts_chunk_cb   cb,
                                   void*               user_data);
 
