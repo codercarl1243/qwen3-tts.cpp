@@ -3086,7 +3086,22 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
         
         n_past++;
     }
-    
+
+    // Diagnostic: dump raw codec codes [n_frames × n_codebooks] LE i32 (overwritten per call).
+    if (const char * dump_path = std::getenv("QWEN3_TTS_DUMP_CODES")) {
+        if (dump_path[0] != '\0') {
+            const int32_t n_frames = (int32_t) (output.size() / cfg.n_codebooks);
+            if (FILE * f = std::fopen(dump_path, "wb")) {
+                std::fwrite(output.data(), sizeof(int32_t), output.size(), f);
+                std::fclose(f);
+                fprintf(stderr, "[dump_codes] wrote %s: %d frames x %d codebooks\n",
+                        dump_path, n_frames, cfg.n_codebooks);
+            } else {
+                fprintf(stderr, "[dump_codes] failed to open %s\n", dump_path);
+            }
+        }
+    }
+
 #ifdef QWEN3_TTS_TIMING
     timing.t_generate_total_ms = std::chrono::duration<double, std::milli>(clk::now() - t_gen_start).count();
     timing_ = nullptr;
