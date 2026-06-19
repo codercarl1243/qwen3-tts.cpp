@@ -356,6 +356,7 @@ extern "C" int qwen3tts_synthesize_streaming(qwen3tts_ctx*     ctx,
                                              const char*       speaker_name,
                                              int32_t           language_id,
                                              int32_t           seed,
+                                             const char*       instruct,
                                              qwen3tts_chunk_cb cb,
                                              void*             user_data) {
     if (!ctx || !ctx->engine || !text || !cb) return -1;
@@ -369,6 +370,7 @@ extern "C" int qwen3tts_synthesize_streaming(qwen3tts_ctx*     ctx,
     qwen3_tts::tts_params params;
     if (language_id > 0) params.language_id = language_id;
     if (seed >= 0) params.seed = seed;
+    if (instruct && instruct[0] != '\0') params.instruction = instruct;
 
     // Resolve preset name → embedding. Empty / null name → zero embedding
     // (model default voice), which synthesize_streaming already handles.

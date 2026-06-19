@@ -66,6 +66,10 @@ typedef void (*qwen3tts_chunk_cb)(const float* pcm,
  *   Pass a positive value to condition the model on a specific language.
  *   Pass 0 or negative to use the model default (no language token inserted).
  *
+ * instruct — optional natural-language voice-steering instruction (e.g.
+ *   "Speak energetically"). Pass NULL or "" for none. When non-empty the text is
+ *   wrapped in the instruction chat template (CustomVoice / VoiceDesign models).
+ *
  * n_samples passed to `cb` is the decoded payload size for the chunk; it is
  * approximately chunk_frames * frame_samples but may vary slightly at edges,
  * so callers must use n_samples rather than assuming a fixed chunk length.
@@ -79,6 +83,7 @@ int qwen3tts_synthesize_streaming(qwen3tts_ctx*       ctx,
                                   const char*         speaker_name,
                                   int32_t             language_id,
                                   int32_t             seed,
+                                  const char*         instruct,
                                   qwen3tts_chunk_cb   cb,
                                   void*               user_data);
 
