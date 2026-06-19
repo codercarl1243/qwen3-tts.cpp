@@ -314,6 +314,8 @@ public:
                   int32_t n_ref_text_tokens = 0,
                   const int32_t * ref_codes = nullptr,
                   int32_t n_ref_frames = 0,
+                  const int32_t * instruct_tokens = nullptr,
+                  int32_t n_instruct_tokens = 0,
                   const FrameCallback & frame_cb = {});
     
     const tts_transformer_config & get_config() const { return model_.config; }
@@ -350,7 +352,9 @@ private:
                              const int32_t * ref_text_tokens = nullptr,
                              int32_t n_ref_text_tokens = 0,
                              const int32_t * ref_codes = nullptr,
-                             int32_t n_ref_frames = 0);
+                             int32_t n_ref_frames = 0,
+                             const int32_t * instruct_tokens = nullptr,
+                             int32_t n_instruct_tokens = 0);
 
     struct ggml_cgraph * build_prefill_forward_graph(int32_t n_tokens, int32_t n_past);
 

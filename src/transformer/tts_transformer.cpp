@@ -1079,7 +1079,9 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
                                          const int32_t * ref_text_tokens,
                                          int32_t n_ref_text_tokens,
                                          const int32_t * ref_codes,
-                                         int32_t n_ref_frames) {
+                                         int32_t n_ref_frames,
+                                         const int32_t * instruct_tokens,
+                                         int32_t n_instruct_tokens) {
     if (!text_tokens) {
         error_msg_ = "text_tokens is null";
         return false;
@@ -1189,6 +1191,11 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
     }
 
     const bool icl_mode = (ref_codes && n_ref_frames > 0 && ref_text_tokens && n_ref_text_tokens > 0);
+
+    if (icl_mode && instruct_tokens && n_instruct_tokens > 0) {
+        error_msg_ = "instruct + ICL voice-clone not supported together";
+        return false;
+    }
 
     if (icl_mode) {
         // ICL prefill layout (matches khimaros/qwen3-tts.cpp 9c57131, which
@@ -1332,12 +1339,29 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
 
     // --- non-ICL path (existing behavior) ----------------------------------
 
-    const int32_t prefill_len = 3 + codec_plus_overlay_len + 1;
+    // Optional instruct prefix: project <|im_start|>user\n{instruct}<|im_end|>\n and
+    // prepend it as a separate embedding segment (matches qwen_tts), keeping the text
+    // role aligned at text_tokens[0:3]. Concatenating it into text_tokens instead
+    // shifts the role/codec/speaker interleaving above and yields filler output.
+    std::vector<float> instruct_embed;
+    if (instruct_tokens && n_instruct_tokens > 0) {
+        if (!project_text_tokens(instruct_tokens, n_instruct_tokens, instruct_embed)) {
+            return false;
+        }
+    }
+    const int32_t n_instruct = (int32_t)(instruct_embed.size() / hidden_size);
+
+    const int32_t prefill_len = n_instruct + 3 + codec_plus_overlay_len + 1;
     prefill_embd.resize((size_t)prefill_len * hidden_size);
-    memcpy(prefill_embd.data(), role_embed.data(), role_embed.size() * sizeof(float));
-    memcpy(prefill_embd.data() + (size_t)3 * hidden_size,
+    float * out_ptr = prefill_embd.data();
+    if (n_instruct > 0) {
+        memcpy(out_ptr, instruct_embed.data(), instruct_embed.size() * sizeof(float));
+        out_ptr += (size_t)n_instruct * hidden_size;
+    }
+    memcpy(out_ptr, role_embed.data(), role_embed.size() * sizeof(float));
+    memcpy(out_ptr + (size_t)3 * hidden_size,
            codec_plus_overlay.data(), codec_plus_overlay.size() * sizeof(float));
-    memcpy(prefill_embd.data() + (size_t)(prefill_len - 1) * hidden_size,
+    memcpy(out_ptr + (size_t)(3 + codec_plus_overlay_len) * hidden_size,
            first_text_plus_codec_bos.data(), hidden_size * sizeof(float));
 
     const int32_t trailing_token_count = std::max(0, n_tokens - 9);
@@ -2828,6 +2852,8 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
                                int32_t n_ref_text_tokens,
                                const int32_t * ref_codes,
                                int32_t n_ref_frames,
+                               const int32_t * instruct_tokens,
+                               int32_t n_instruct_tokens,
                                const FrameCallback & frame_cb) {
 #ifdef QWEN3_TTS_TIMING
     using clk = std::chrono::high_resolution_clock;
@@ -2866,7 +2892,8 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     if (!build_prefill_graph(text_tokens, n_tokens, speaker_embd, language_id,
                              prefill_embd, trailing_text_hidden, tts_pad_embed,
                              ref_text_tokens, n_ref_text_tokens,
-                             ref_codes, n_ref_frames)) {
+                             ref_codes, n_ref_frames,
+                             instruct_tokens, n_instruct_tokens)) {
         return false;
     }
 #ifdef QWEN3_TTS_TIMING

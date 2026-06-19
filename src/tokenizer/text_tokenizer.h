@@ -32,9 +32,9 @@ public:
     // Encode with TTS format: <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
     std::vector<int32_t> encode_for_tts(const std::string & text) const;
 
-    // Encode with instruction: <|im_start|>user\n{instruction}<|im_end|>\n<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
-    std::vector<int32_t> encode_for_tts_with_instruction(const std::string & text,
-                                                          const std::string & instruction) const;
+    // Encode just the instruction prefix as a separate segment (matches qwen_tts
+    // _build_instruct_text): <|im_start|>user\n{instruction}<|im_end|>\n
+    std::vector<int32_t> encode_instruction(const std::string & instruction) const;
     
     // Decode token IDs to text
     std::string decode(const std::vector<int32_t> & tokens) const;

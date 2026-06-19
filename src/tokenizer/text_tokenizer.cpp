@@ -318,34 +318,22 @@ std::vector<int32_t> TextTokenizer::encode_for_tts(const std::string & text) con
     return tokens;
 }
 
-std::vector<int32_t> TextTokenizer::encode_for_tts_with_instruction(
-        const std::string & text, const std::string & instruction) const {
+std::vector<int32_t> TextTokenizer::encode_instruction(const std::string & instruction) const {
     if (!loaded_) {
         return {};
     }
 
-    // Format: <|im_start|>user\n{instruction}<|im_end|>\n<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
+    // Format: <|im_start|>user\n{instruction}<|im_end|>\n  — a separate prefix segment.
+    // The talker prefill projects and prepends this, keeping the text role aligned at
+    // text_tokens[0:3]. (Concatenating it into the text stream misaligns the
+    // role/codec/speaker interleaving in build_prefill_graph and yields filler.)
     std::vector<int32_t> tokens;
-
-    // <|im_start|>user\n{instruction}<|im_end|>\n
     tokens.push_back(config_.bos_token_id);
     tokens.push_back(user_token_id_);
     tokens.push_back(newline_token_id_);
     auto instr_tokens = encode(instruction);
     tokens.insert(tokens.end(), instr_tokens.begin(), instr_tokens.end());
     tokens.push_back(config_.eos_token_id);
-    tokens.push_back(newline_token_id_);
-
-    // <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
-    tokens.push_back(config_.bos_token_id);
-    tokens.push_back(assistant_token_id_);
-    tokens.push_back(newline_token_id_);
-    auto text_tokens = encode(text);
-    tokens.insert(tokens.end(), text_tokens.begin(), text_tokens.end());
-    tokens.push_back(config_.eos_token_id);
-    tokens.push_back(newline_token_id_);
-    tokens.push_back(config_.bos_token_id);
-    tokens.push_back(assistant_token_id_);
     tokens.push_back(newline_token_id_);
 
     return tokens;
