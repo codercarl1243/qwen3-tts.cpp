@@ -337,6 +337,24 @@ struct qwen3tts_ctx {
     explicit qwen3tts_ctx(Qwen3Tts* e) : engine(e), cancel_flag(false) {}
 };
 
+/* Tuning-env overrides: when the named var is set to a valid number, return it;
+ * else return the passed-through default. Drives the hand-editable tuning file
+ * (see tts_engine/src/engine/tuning.rs). */
+static float env_f32(const char* key, float fallback) {
+    const char* v = std::getenv(key);
+    if (!v || !*v) return fallback;
+    char* end = nullptr;
+    float parsed = std::strtof(v, &end);
+    return (end == v || *end != '\0') ? fallback : parsed;
+}
+static int32_t env_i32(const char* key, int32_t fallback) {
+    const char* v = std::getenv(key);
+    if (!v || !*v) return fallback;
+    char* end = nullptr;
+    long parsed = std::strtol(v, &end, 10);
+    return (end == v || *end != '\0') ? fallback : (int32_t) parsed;
+}
+
 extern "C" qwen3tts_ctx* qwen3tts_context_new(const char* model_dir) {
     if (!model_dir) return nullptr;
     Qwen3Tts* engine = qwen3_tts_create(model_dir, 4);
@@ -371,6 +389,17 @@ extern "C" int qwen3tts_synthesize_streaming(qwen3tts_ctx*     ctx,
     if (language_id > 0) params.language_id = language_id;
     if (seed >= 0) params.seed = seed;
     if (instruct && instruct[0] != '\0') params.instruction = instruct;
+
+    // Tuning-env overrides (tts.tuning.env): each wins over the built-in default
+    // / FFI arg when set. top_p is read for completeness but the streaming
+    // sampler only applies temperature + top_k + repetition_penalty.
+    params.temperature        = env_f32("QWEN3_TTS_TEMPERATURE", params.temperature);
+    params.top_k              = env_i32("QWEN3_TTS_TOP_K", params.top_k);
+    params.top_p              = env_f32("QWEN3_TTS_TOP_P", params.top_p);
+    params.repetition_penalty = env_f32("QWEN3_TTS_REPETITION_PENALTY", params.repetition_penalty);
+    params.max_audio_tokens   = env_i32("QWEN3_TTS_MAX_AUDIO_TOKENS", params.max_audio_tokens);
+    params.seed               = env_i32("QWEN3_TTS_SEED", params.seed);
+    chunk_frames              = (uint32_t) env_i32("QWEN3_TTS_CHUNK_FRAMES", (int32_t) chunk_frames);
 
     // Resolve preset name → embedding. Empty / null name → zero embedding
     // (model default voice), which synthesize_streaming already handles.
