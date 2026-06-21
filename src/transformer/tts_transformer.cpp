@@ -128,6 +128,9 @@ bool TTSTransformer::load_model(const std::string & model_path) {
     const char * device_name = device ? ggml_backend_dev_name(device) : "Unknown";
     fprintf(stderr, "  TTSTransformer backend: %s\n", device_name);
 
+    // Talker thread budget — split physical cores with the vocoder's private backend.
+    set_backend_cpu_threads_from_env(state_.backend, "QWEN3_TTS_TALKER_THREADS");
+
     if (device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
         state_.backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (!state_.backend_cpu) {

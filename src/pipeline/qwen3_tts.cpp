@@ -8,6 +8,10 @@
 #include <fstream>
 #include <cstdint>
 #include <cstdlib>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
 
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -696,45 +700,19 @@ bool Qwen3TTS::synthesize_streaming(const std::string & text,
     if (first_chunk_frames < 1) first_chunk_frames = 1;
     if (first_chunk_frames > chunk_frames) first_chunk_frames = chunk_frames;
 
-    // Accumulate the full codec-frame buffer so each chunk decode has its true
-    // left context. payload_start tracks the first not-yet-emitted frame.
-    std::vector<int32_t> all_codes;
-    all_codes.reserve((size_t) params.max_audio_tokens * n_codebooks);
-    int32_t total_frames = 0;
-    int32_t payload_start = 0;
-    int32_t effective_chunk = first_chunk_frames;
-    bool failed = false;
-
-    auto emit_through = [&](int32_t up_to) -> bool {
-        std::vector<float> pcm;
-        if (!audio_decoder_.decode_chunk_with_context(
-                all_codes.data(), up_to, payload_start, context_frames, pcm)) {
-            error_msg_ = "Streaming decode failed: " + audio_decoder_.get_error();
-            return false;
-        }
-        payload_start = up_to;
-        if (!pcm.empty() && on_chunk) {
-            on_chunk(pcm.data(), pcm.size());
-        }
-        return true;
-    };
-
-    TTSTransformer::FrameCallback frame_cb =
-        [&](const int32_t * frame_codes, int32_t ncb) -> bool {
-        if (cancel_flag && cancel_flag->load(std::memory_order_acquire)) {
-            return false;  // stop; trailing partial chunk flushed after generate()
-        }
-        all_codes.insert(all_codes.end(), frame_codes, frame_codes + ncb);
-        ++total_frames;
-        if (total_frames - payload_start >= effective_chunk) {
-            if (!emit_through(total_frames)) {
-                failed = true;
-                return false;
-            }
-            effective_chunk = std::min(chunk_frames, effective_chunk * 2);
-        }
-        return true;
-    };
+    // Producer/consumer split: the talker (this calling thread) produces codec
+    // frames; a dedicated decoder thread runs the vocoder so wall ≈
+    // max(talker, vocoder) instead of their sum. The talker never reads vocoder
+    // output, so the emitted PCM is byte-identical to an inline decode (given a
+    // private vocoder backend — the shared singleton races under concurrent compute).
+    // [UNTESTABLE — C++ thread orchestration; covered by ja_diag byte-identical + RTF]
+    struct FrameQueue {
+        std::mutex mtx;
+        std::condition_variable cv;
+        std::queue<std::vector<int32_t>> frames;
+        bool producer_done = false;
+        bool decode_failed = false;
+    } queue;
 
     // Zero speaker embedding = model default voice (matches synthesize()); a
     // non-null pointer keeps the prefill's speaker slot, so the layout matches
@@ -746,24 +724,118 @@ bool Qwen3TTS::synthesize_streaming(const std::string & text,
         embd = speaker_embedding;
     }
 
-    std::vector<int32_t> speech_codes;  // generate() fills this too; we decode from all_codes
-    if (!transformer_.generate(text_tokens.data(), (int32_t) text_tokens.size(),
-                               embd, params.max_audio_tokens, speech_codes,
-                               params.language_id, params.repetition_penalty,
-                               params.temperature, params.top_k,
-                               nullptr, 0, nullptr, 0,
-                               instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
-                               (int32_t) instruct_tokens.size(), frame_cb)) {
+    // Decoder thread: owns its own frame accumulator (never shares the growing
+    // buffer with the producer). Decodes payload chunks in arrival order with the
+    // same growing schedule and left context as the inline path, and invokes
+    // on_chunk in order (single consumer ⇒ serial, ordered). payload_start tracks
+    // the first not-yet-emitted frame; context_frames before it are re-decoded
+    // only to prime the causal conv stack.
+    std::thread decoder_thread([&]() {
+        std::vector<int32_t> all_codes;
+        all_codes.reserve((size_t) params.max_audio_tokens * n_codebooks);
+        int32_t total_frames = 0;
+        int32_t payload_start = 0;
+        int32_t effective_chunk = first_chunk_frames;
+
+        auto emit_through = [&](int32_t up_to) -> bool {
+            std::vector<float> pcm;
+            if (!audio_decoder_.decode_chunk_with_context(
+                    all_codes.data(), up_to, payload_start, context_frames, pcm)) {
+                error_msg_ = "Streaming decode failed: " + audio_decoder_.get_error();
+                return false;
+            }
+            payload_start = up_to;
+            if (!pcm.empty() && on_chunk) {
+                on_chunk(pcm.data(), pcm.size());
+            }
+            return true;
+        };
+
+        for (;;) {
+            std::vector<std::vector<int32_t>> batch;
+            bool done;
+            {
+                std::unique_lock<std::mutex> lock(queue.mtx);
+                queue.cv.wait(lock, [&]() {
+                    return !queue.frames.empty() || queue.producer_done;
+                });
+                while (!queue.frames.empty()) {
+                    batch.push_back(std::move(queue.frames.front()));
+                    queue.frames.pop();
+                }
+                done = queue.producer_done && queue.frames.empty();
+            }
+            // Process one frame at a time so chunk boundaries match the inline
+            // path exactly regardless of how frames were batched off the queue.
+            for (auto & frame : batch) {
+                all_codes.insert(all_codes.end(), frame.begin(), frame.end());
+                ++total_frames;
+                if (total_frames - payload_start >= effective_chunk) {
+                    if (!emit_through(total_frames)) {
+                        std::lock_guard<std::mutex> lock(queue.mtx);
+                        queue.decode_failed = true;
+                        return;
+                    }
+                    effective_chunk = std::min(chunk_frames, effective_chunk * 2);
+                }
+            }
+            if (done) {
+                break;
+            }
+        }
+
+        // Flush trailing frames (final partial chunk, or everything if total <
+        // chunk, including the trailing partial left after a cancel).
+        if (total_frames > payload_start) {
+            if (!emit_through(total_frames)) {
+                std::lock_guard<std::mutex> lock(queue.mtx);
+                queue.decode_failed = true;
+            }
+        }
+    });
+
+    // Producer hook: enqueue a copy of the frame codes and wake the decoder.
+    // Honors cancel_flag (stops the talker; the decoder still flushes the trailing
+    // partial) and stops early if the decoder reported a failure.
+    TTSTransformer::FrameCallback frame_cb =
+        [&](const int32_t * frame_codes, int32_t ncb) -> bool {
+        if (cancel_flag && cancel_flag->load(std::memory_order_acquire)) {
+            return false;  // stop; trailing partial chunk flushed by the decoder
+        }
+        {
+            std::lock_guard<std::mutex> lock(queue.mtx);
+            if (queue.decode_failed) {
+                return false;
+            }
+            queue.frames.emplace(frame_codes, frame_codes + ncb);
+        }
+        queue.cv.notify_one();
+        return true;
+    };
+
+    std::vector<int32_t> speech_codes;  // generate() fills this too; the decoder thread emits PCM
+    bool talker_ok = transformer_.generate(
+        text_tokens.data(), (int32_t) text_tokens.size(), embd, params.max_audio_tokens,
+        speech_codes, params.language_id, params.repetition_penalty, params.temperature,
+        params.top_k, nullptr, 0, nullptr, 0,
+        instruct_tokens.empty() ? nullptr : instruct_tokens.data(),
+        (int32_t) instruct_tokens.size(), frame_cb);
+
+    // Signal end-of-stream and wait for the decoder to drain + flush.
+    {
+        std::lock_guard<std::mutex> lock(queue.mtx);
+        queue.producer_done = true;
+    }
+    queue.cv.notify_one();
+    decoder_thread.join();
+
+    if (!talker_ok) {
         error_msg_ = "Failed to generate speech codes: " + transformer_.get_error();
         return false;
     }
-    if (failed) {
-        return false;
-    }
-
-    // Flush trailing frames (final partial chunk, or everything if total < chunk).
-    if (total_frames > payload_start) {
-        if (!emit_through(total_frames)) {
+    {
+        std::lock_guard<std::mutex> lock(queue.mtx);
+        if (queue.decode_failed) {
             return false;
         }
     }

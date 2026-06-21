@@ -49,7 +49,8 @@ void AudioTokenizerDecoder::unload_model() {
         state_.sched = nullptr;
     }
     if (state_.backend) {
-        release_preferred_backend(state_.backend);
+        // Private (unshared) backend — free directly; never touch the shared refcount.
+        ggml_backend_free(state_.backend);
         state_.backend = nullptr;
     }
     if (state_.backend_cpu) {
@@ -364,7 +365,9 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
     
     normalize_codebooks();
 
-    state_.backend = init_preferred_backend("AudioTokenizerDecoder", &error_msg_);
+    // Private backend (not the shared singleton) so the vocoder can decode
+    // concurrently with the talker — see synthesize_streaming's producer/consumer split.
+    state_.backend = init_private_backend("AudioTokenizerDecoder", &error_msg_);
     if (!state_.backend) {
         return false;
     }
@@ -372,7 +375,10 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
     ggml_backend_dev_t device = ggml_backend_get_device(state_.backend);
     const char * device_name = device ? ggml_backend_dev_name(device) : "Unknown";
     fprintf(stderr, "  AudioTokenizerDecoder backend: %s\n", device_name);
-    
+
+    // Vocoder thread budget — runs concurrently with the talker, so split cores.
+    set_backend_cpu_threads_from_env(state_.backend, "QWEN3_TTS_VOCODER_THREADS");
+
     if (device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
         state_.backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
         if (!state_.backend_cpu) {

@@ -77,10 +77,19 @@ bool load_tensor_data_from_file(
 ggml_backend_t init_preferred_backend(const char * component_name, std::string * error_msg);
 void release_preferred_backend(ggml_backend_t backend);
 
+// Fresh, unshared backend (caller owns it; free with ggml_backend_free). Lets the
+// vocoder compute concurrently with the talker without racing the shared singleton.
+ggml_backend_t init_private_backend(const char * component_name, std::string * error_msg);
+
 // Helper function to free model resources
 void free_ggml_resources(struct ggml_context * ctx, ggml_backend_buffer_t buffer);
 
 // Returns true if the given backend is a GPU (GPU, IGPU, or ACCEL type)
 bool backend_is_gpu(ggml_backend_t backend);
+
+// If env_var holds a positive int and backend is a CPU backend, set its thread
+// count. No-op on GPU backends or when the var is unset/invalid. Lets the talker
+// and vocoder split physical cores so two CPU threadpools don't oversubscribe.
+void set_backend_cpu_threads_from_env(ggml_backend_t backend, const char * env_var);
 
 } // namespace qwen3_tts

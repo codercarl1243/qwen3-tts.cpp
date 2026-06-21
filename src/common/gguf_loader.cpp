@@ -1,4 +1,5 @@
 #include "common/gguf_loader.h"
+#include "ggml-cpu.h"
 
 #include <cerrno>
 #include <climits>
@@ -143,23 +144,10 @@ ggml_backend_t init_tensor_loader_backend(enum ggml_backend_dev_type preferred_b
     }
     return backend;
 }
-}
 
-GGUFLoader::GGUFLoader() = default;
-
-GGUFLoader::~GGUFLoader() {
-    close();
-}
-
-ggml_backend_t init_preferred_backend(const char * component_name, std::string * error_msg) {
-    if (error_msg) error_msg->clear();
-
-    auto & shared = get_shared_backend_state();
-    if (shared.backend) {
-        shared.ref_count++;
-        return shared.backend;
-    }
-
+// Create a fresh backend per QWEN3_TTS_BACKEND mode (auto: IGPU→GPU→ACCEL→CPU).
+// No sharing/refcount — callers decide ownership.
+ggml_backend_t create_backend_for_mode(const char * component_name, std::string * error_msg) {
     ggml_backend_t backend = nullptr;
     const backend_mode mode = get_backend_mode_from_env();
     if (mode == backend_mode::CPU) {
@@ -188,13 +176,40 @@ ggml_backend_t init_preferred_backend(const char * component_name, std::string *
         *error_msg = "Failed to initialize backend for " + std::string(name)
             + " (QWEN3_TTS_BACKEND=auto|cpu|cuda)";
     }
+    return backend;
+}
+}
 
+GGUFLoader::GGUFLoader() = default;
+
+GGUFLoader::~GGUFLoader() {
+    close();
+}
+
+ggml_backend_t init_preferred_backend(const char * component_name, std::string * error_msg) {
+    if (error_msg) error_msg->clear();
+
+    auto & shared = get_shared_backend_state();
+    if (shared.backend) {
+        shared.ref_count++;
+        return shared.backend;
+    }
+
+    ggml_backend_t backend = create_backend_for_mode(component_name, error_msg);
     if (backend) {
         shared.backend = backend;
         shared.ref_count = 1;
     }
 
     return backend;
+}
+
+ggml_backend_t init_private_backend(const char * component_name, std::string * error_msg) {
+    if (error_msg) error_msg->clear();
+    // Fresh, unshared backend: the caller owns it and must ggml_backend_free it.
+    // The vocoder uses this so it can compute concurrently with the talker — two
+    // scheds over the shared singleton race its work buffer and abort in get_rows.
+    return create_backend_for_mode(component_name, error_msg);
 }
 
 void release_preferred_backend(ggml_backend_t backend) {
@@ -384,6 +399,16 @@ bool backend_is_gpu(ggml_backend_t backend) {
     return type == GGML_BACKEND_DEVICE_TYPE_GPU ||
            type == GGML_BACKEND_DEVICE_TYPE_IGPU ||
            type == GGML_BACKEND_DEVICE_TYPE_ACCEL;
+}
+
+void set_backend_cpu_threads_from_env(ggml_backend_t backend, const char * env_var) {
+    if (!backend || !env_var) return;
+    const char * env = std::getenv(env_var);
+    int n_threads = 0;
+    if (!env || !parse_non_negative_int(env, n_threads) || n_threads <= 0) return;
+    if (backend_is_gpu(backend)) return;  // CPU-only knob; no-op on GPU/Metal
+    ggml_backend_cpu_set_n_threads(backend, n_threads);
+    fprintf(stderr, "  [backend] %s = %d threads\n", env_var, n_threads);
 }
 
 } // namespace qwen3_tts
