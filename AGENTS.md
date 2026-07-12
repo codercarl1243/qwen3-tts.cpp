@@ -1,184 +1,72 @@
-# AGENTS.md
+# AGENTS.md — qwen3-tts.cpp fork
 
-Coding conventions and architecture guide for AI agents working on this codebase.
+Fork-specific reference for the Qwen3-TTS C++ pipeline (talker → code predictor → vocoder). This holds what clangd can't give you: architecture, exact token layout, and divergence from the base. Navigation/build gotchas are in `CLAUDE.md`.
 
-## Project Overview
+## Build
 
-`qwen3-tts.cpp` is a pure C++17 implementation of the Qwen3-TTS text-to-speech pipeline using GGML. It converts text to speech through four stages: tokenization, speaker encoding, transformer code generation, and vocoder decoding.
+- CMake 3.14+, C++17. GGML is vendored under `./ggml`.
+- GGML first: `cmake -S ggml -B ggml/build -DGGML_METAL=ON && cmake --build ggml/build -j4`
+- Project: `cmake -S . -B build && cmake --build build -j4`
 
-## Repository Structure
+## C++ conventions
 
-```
-qwen3-tts.cpp/
-  src/
-    common/                     # Shared infrastructure (compiled once)
-      gguf_loader.{h,cpp}      # GGUF model loading + backend management
-      coreml_code_predictor.{h,mm}  # Optional CoreML bridge (macOS)
-    tokenizer/                  # Text processing
-      text_tokenizer.{h,cpp}   # BPE text tokenizer
-    transformer/                # Code generation
-      tts_transformer.{h,cpp}  # TTS transformer (talker + code predictor)
-    encoder/                    # Speaker encoding
-      audio_tokenizer_encoder.{h,cpp}  # ECAPA-TDNN speaker encoder
-    decoder/                    # Audio synthesis
-      audio_tokenizer_decoder.{h,cpp}  # WavTokenizer vocoder
-    pipeline/                   # Orchestration + API
-      qwen3_tts.{h,cpp}        # Full pipeline orchestration
-      qwen3tts_c_api.{h,cpp}   # C API wrapper for FFI
-    main.cpp                    # CLI entry point
-  tests/                        # Component tests
-    test_codebook.cpp
-    test_vq_only.cpp
-    test_tokenizer.cpp
-    test_encoder.cpp
-    test_transformer.cpp        # Deterministic reference comparison
-    test_decoder.cpp
-  scripts/                      # Python utilities
-    convert_tts_to_gguf.py      # HuggingFace -> GGUF converter (TTS model)
-    convert_tokenizer_to_gguf.py # HuggingFace -> GGUF converter (vocoder)
-    generate_deterministic_reference.py  # Generate Python reference data
-    compare_e2e.py              # End-to-end Python vs C++ comparison
-    run_all_tests.sh            # Test runner
-  reference/                    # Reference data (*.bin gitignored, *.json tracked)
-  models/                       # GGUF models (gitignored)
-  CMakeLists.txt
-```
+- C++17, no exceptions, no RTTI. `#pragma once` guards.
+- Log via `fprintf(stderr, ...)`, not `std::cerr`.
+- Methods return `bool`; error detail in the `error_msg_` member.
+- GGML contexts own tensor memory — free with `ggml_free()`.
+- `snake_case` functions/vars, `PascalCase` classes, `UPPER_CASE` macros. Public types in the `qwen3_tts` namespace.
+- Includes are module-qualified: `#include "common/gguf_loader.h"`.
 
-Includes use module-qualified paths: `#include "common/gguf_loader.h"`, `#include "pipeline/qwen3_tts.h"`, etc.
+## GGML forward pass
 
-## Build System
+Every pass: build graph → `ggml_backend_sched_alloc_graph` → set inputs (`ggml_backend_tensor_set`) → `ggml_backend_sched_graph_compute` → read outputs (`ggml_backend_tensor_get`) → `ggml_backend_sched_reset`.
 
-- **CMake 3.14+** with C++17
-- GGML is vendored under `./ggml` and linked from `./ggml/build/src`
-- Build GGML first: `cmake -S ggml -B ggml/build -DGGML_METAL=ON && cmake --build ggml/build -j4`
-- Build project: `cmake -S . -B build && cmake --build build -j4`
-- Timing build: `cmake -S . -B build -DQWEN3_TTS_TIMING=ON && cmake --build build -j4`
-- GGML headers are in `./ggml/include`
+Gotcha: `ggml_cast` to F32 before `ggml_mul_mat` when the weight is F16 (`ffn_down` in talker and code predictor).
 
-## Coding Conventions
+Backend: `init_preferred_backend()` (`src/common/gguf_loader.cpp`) orders `IGPU → GPU → ACCEL → CPU`; add a CPU fallback backend to the scheduler when the runtime backend isn't CPU. The vocoder runs a private backend (`init_private_backend`) for talker‖vocoder concurrency.
 
-### C++ Style
+## Architecture
 
-- C++17 standard, no exceptions, no RTTI
-- Use `fprintf(stderr, ...)` for logging, not `std::cerr`
-- Error handling: methods return `bool`, error details stored in `error_msg_` member
-- Memory: GGML contexts own tensor memory; use `ggml_free()` for cleanup
-- Naming: `snake_case` for functions/variables, `PascalCase` for classes, `UPPER_CASE` for macros
-- Header guards: `#pragma once`
-- All public types in `qwen3_tts` namespace
+Two sub-models in `src/transformer/tts_transformer.cpp` (~3200 lines; `generate`, `forward_prefill`, `forward_step`, `predict_codes_autoregressive`):
 
-### GGML Patterns
+1. **Talker** — 28-layer Qwen2 (1024 hidden, 16 heads, 8 KV, 128 head_dim). In: prefill or step embedding `[1,1024]`. Out: hidden states + codec logits via `codec_head`.
+2. **Code predictor** — 5-layer, same attention config, own KV cache (max 16). In: talker hidden + codebook-0 embedding. Out: 15 codebook predictions, autoregressive.
 
-Every forward pass follows this pattern:
-
-```cpp
-// 1. Build computation graph
-struct ggml_cgraph * gf = build_xxx_graph(...);
-
-// 2. Allocate graph memory
-ggml_backend_sched_alloc_graph(state_.sched, gf);
-
-// 3. Set input tensors
-struct ggml_tensor * inp = ggml_graph_get_tensor(gf, "input_name");
-ggml_backend_tensor_set(inp, data, 0, size);
-
-// 4. Compute
-ggml_backend_sched_graph_compute(state_.sched, gf);
-
-// 5. Get output tensors
-struct ggml_tensor * out = ggml_graph_get_tensor(gf, "output_name");
-ggml_backend_tensor_get(out, output_data, 0, size);
-
-// 6. Reset scheduler
-ggml_backend_sched_reset(state_.sched);
-```
-
-Important: `ggml_cast` to F32 is needed before `ggml_mul_mat` when weight tensors are F16 (specifically `ffn_down` in both talker and code predictor layers).
-
-Backend initialization and scheduling notes:
-
-- Use `init_preferred_backend()` (`src/gguf_loader.cpp`) to select backend in order: `IGPU -> GPU -> ACCEL -> CPU`
-- If the selected runtime backend is not CPU, add a CPU backend as scheduler fallback (`backend_cpu`) when calling `ggml_backend_sched_new(...)`
-- Decoder follows the same backend preference; load decoder weights with `GGML_BACKEND_DEVICE_TYPE_IGPU` preference for Metal-first execution
-
-### Model Architecture
-
-The TTS transformer has two sub-models:
-
-1. **Talker** — 28-layer Qwen2 transformer (1024 hidden, 16 heads, 8 KV heads, 128 head_dim)
-   - Input: prefill embedding or step embedding (float32, [1, 1024])
-   - Output: hidden states + codec logits via `codec_head`
-
-2. **Code Predictor** — 5-layer transformer (same attention config)
-   - Input: talker hidden state + codebook-0 embedding (2-token prefill)
-   - Output: 15 codebook predictions (autoregressive, one per step)
-   - Has its own separate KV cache (max 16 tokens)
-
-### Prefill Embedding Structure (10 positions for single-word input)
+### Prefill embedding (10 positions, single-word input)
 
 ```
-Pos 0:   text_projection(<|im_start|>)
-Pos 1:   text_projection(assistant)
-Pos 2:   text_projection(\n)
-Pos 3:   tts_pad + codec_embd(think_id)
-Pos 4:   tts_pad + codec_embd(think_bos_id)
-Pos 5:   tts_pad + codec_embd(language_id)
-Pos 6:   tts_pad + codec_embd(think_eos_id)
-Pos 7:   tts_pad + speaker_embedding
-Pos 8:   tts_bos + codec_embd(pad_id)
-Pos 9+:  text_projection(text_token[i]) + codec_embd(bos_id or pad_id)
+Pos 0:  text_projection(<|im_start|>)
+Pos 1:  text_projection(assistant)
+Pos 2:  text_projection(\n)
+Pos 3:  tts_pad + codec_embd(think_id)
+Pos 4:  tts_pad + codec_embd(think_bos_id)
+Pos 5:  tts_pad + codec_embd(language_id)
+Pos 6:  tts_pad + codec_embd(think_eos_id)
+Pos 7:  tts_pad + speaker_embedding
+Pos 8:  tts_bos + codec_embd(pad_id)
+Pos 9+: text_projection(text_token[i]) + codec_embd(bos_id or pad_id)
 ```
 
-This structure must mirror the Python pipeline exactly.
+Must mirror the Python pipeline exactly.
 
-### Special Token IDs
+### Special token IDs
+
+Authoritative in `src/transformer/tts_transformer.h`:
 
 ```
-tts_bos = 151672, tts_eos = 151673, tts_pad = 151671
-codec_bos = 2149, codec_eos = 2150, codec_pad = 2148
-codec_think = 2154, codec_think_bos = 2156, codec_think_eos = 2157
-english_language_id = 2050
+tts_bos=151672   tts_eos=151673   tts_pad=151671
+codec_bos=2149   codec_eos=2150   codec_pad=2148
+codec_think=2154 codec_think_bos=2156 codec_think_eos=2157
+english_language_id=2050
 ```
 
-### Key Files to Understand
+## Divergence & limitations
 
-- `tts_transformer.cpp` — The core file (~2300 lines). Contains `generate()`, `forward_prefill()`, `forward_step()`, `predict_codes_autoregressive()`, and all graph builders.
-- `qwen3_tts.cpp` — Pipeline orchestration. Calls tokenizer, encoder, transformer, decoder in sequence.
-- `CMakeLists.txt` — Build configuration. Each component is a separate static library.
+- F16 weights diverge from Python float32 in autoregressive decode — speech codes differ, audio is perceptually equivalent.
+- M-RoPE uses 1D positions (equivalent for single-batch).
+- `--top-p` is parsed but unused in sampling.
+- Code predictor is the bottleneck (~71% of generation: 15 sequential passes/frame); talker ~27%.
 
 ## Testing
 
-### Reference Data
-
-Deterministic reference data is generated by `scripts/generate_deterministic_reference.py` using float32 Python inference with greedy decoding. Files go in `reference/det_*.bin` (gitignored) and `reference/det_*.json` (tracked).
-
-### Test Strategy
-
-- `test_transformer` loads reference data and compares C++ output at each stage
-- Pass criteria: prefill logits cosine > 0.99; speech codes partially match (F16 precision causes divergence)
-- E2E comparison (`compare_e2e.py`): checks both pipelines produce valid non-silent audio with similar duration; waveform correlation is informational only
-
-### Running Tests
-
-```bash
-bash scripts/run_all_tests.sh           # Full suite
-./build/test_transformer --ref-dir reference/  # Transformer only
-```
-
-## Git Conventions
-
-- Conventional commits: `feat(scope):`, `fix(scope):`, `docs:`
-- Scopes: `transformer`, `vocoder`, `test`, `timing`
-- One logical change per commit
-- Do not commit model files (*.gguf) or reference binaries (*.bin)
-
-## Known Limitations
-
-- F16 model weights cause autoregressive divergence vs Python's float32 — speech codes differ but audio is perceptually equivalent
-- M-RoPE uses 1D positions (equivalent for single-batch, may differ for batched inference)
-- `--top-p` is parsed in CLI params but currently not used in transformer sampling
-- Top-level CMake expects vendored GGML at `./ggml`
-
-## Performance Profile
-
-The code predictor is the primary bottleneck (~71% of generation time) because it runs 15 sequential forward passes per frame (1 prefill + 14 autoregressive steps). The talker accounts for ~27%. Graph build/alloc and data I/O are negligible (<1%).
+Reference comparison: `bash scripts/run_all_tests.sh`, or `./build/test_transformer --ref-dir reference/`. Pass = prefill logits cosine > 0.99 (speech codes diverge under F16).
